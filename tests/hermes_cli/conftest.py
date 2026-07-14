@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 
@@ -16,7 +19,28 @@ def all_assignees_spawnable(monkeypatch):
     would break tests that assert spawn behavior.
     """
     from hermes_cli import profiles
+
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    # Dispatcher preflight resolves the profile home after the existence guard.
+    # Synthetic assignees in legacy unit tests share the fixture's disposable
+    # HERMES_HOME; patch both halves of that contract deterministically.
+    monkeypatch.setattr(
+        profiles,
+        "resolve_profile_env",
+        lambda name: os.environ["HERMES_HOME"],
+    )
+
+
+@pytest.fixture
+def required_review_skill(kanban_home):
+    """Install the review capability required by fail-closed dispatch tests."""
+    skill_dir = Path(kanban_home) / "skills" / "sdlc-review"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "---\nname: sdlc-review\ndescription: Review changes.\n---\n",
+        encoding="utf-8",
+    )
+    return skill_dir
 
 
 @pytest.fixture(autouse=True)

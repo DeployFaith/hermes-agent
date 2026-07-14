@@ -2247,7 +2247,9 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
     assert f"branch refs/heads/{branch}" in listed
 
 
-def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanban_home, tmp_path, monkeypatch):
+def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(
+    kanban_home, tmp_path, monkeypatch, all_assignees_spawnable,
+):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     kb.create_board("worktree-board", default_workdir=str(repo))
@@ -2286,7 +2288,9 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
     assert f"branch refs/heads/wt/{tid}" in listed
 
 
-def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
+def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(
+    kanban_home, tmp_path, monkeypatch, all_assignees_spawnable,
+):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     kb.create_board("worktree-rerun-board", default_workdir=str(repo))
@@ -3895,7 +3899,9 @@ def test_claim_review_task_fails_when_already_claimed(kanban_home):
     assert second is None
 
 
-def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
+def test_dispatch_review_dry_run(
+    kanban_home, all_assignees_spawnable, required_review_skill,
+):
     """dispatch_once dry-run sees review tasks and reports them as spawned."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
@@ -3909,7 +3915,7 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
 
 
 def test_dispatch_review_spawns_with_correct_skills(
-    kanban_home, all_assignees_spawnable,
+    kanban_home, all_assignees_spawnable, required_review_skill,
 ):
     """Review tasks get sdlc-review skill set before spawning."""
     spawned_tasks = []
@@ -3960,7 +3966,7 @@ def test_dispatch_review_counts_toward_max_spawn(
 
 
 def test_dispatch_review_spawns_when_ready_empty(
-    kanban_home, all_assignees_spawnable,
+    kanban_home, all_assignees_spawnable, required_review_skill,
 ):
     """When only review tasks exist, they still get dispatched."""
     spawns = []

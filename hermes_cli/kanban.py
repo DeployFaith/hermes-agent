@@ -628,6 +628,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    p_reconcile = sub.add_parser(
+        "reconcile-archived-runs",
+        help="Inspect or close conclusively-local expired runs under archived tasks",
+    )
+    p_reconcile.add_argument("task_ids", nargs="+", help="Archived task ids to inspect")
+    p_reconcile.add_argument(
+        "--apply", action="store_true",
+        help="Apply eligible repairs (default is transactionally read-only dry-run)",
+    )
+    p_reconcile.add_argument(
+        "--allow-partial", action="store_true",
+        help="With --apply, repair eligible rows even if another id is refused",
+    )
+    p_reconcile.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -958,6 +973,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "reconcile-archived-runs": _cmd_reconcile_archived_runs,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -2096,6 +2112,48 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_reconcile_archived_runs(args: argparse.Namespace) -> int:
+    if args.allow_partial and not args.apply:
+        print("--allow-partial requires --apply", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        result = kb.reconcile_archived_runs(
+            conn,
+            args.task_ids,
+            apply=bool(args.apply),
+            allow_partial=bool(args.allow_partial),
+        )
+    payload = {
+        "mode": "apply" if args.apply else "dry-run",
+        "atomic": result.atomic,
+        "applied": result.applied,
+        "refused": result.refused,
+        "ok": result.refused == 0,
+        "items": [
+            {
+                "task_id": item.task_id,
+                "run_id": item.run_id,
+                "eligible": item.eligible,
+                "applied": item.applied,
+                "reason": item.reason,
+            }
+            for item in result.items
+        ],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Archived-run reconciliation ({payload['mode']}, "
+            f"{'atomic' if result.atomic else 'allow-partial'}): "
+            f"applied={result.applied} refused={result.refused}"
+        )
+        for item in result.items:
+            state = "APPLIED" if item.applied else ("ELIGIBLE" if item.eligible else "REFUSED")
+            print(f"  {state:8s} {item.task_id} run={item.run_id or '-'} reason={item.reason}")
+    return 0 if result.refused == 0 else 1
+
+
 def _cmd_tail(args: argparse.Namespace) -> int:
     last_id = 0
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
@@ -2176,6 +2234,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "preflight_blocked": [
+                {"task_id": tid, "reason": reason}
+                for tid, reason in res.preflight_blocked
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2215,9 +2277,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             )
     if res.skipped_nonspawnable:
         print(
-            f"Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"Refused (invalid or nonlocal assignee): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, reason in res.preflight_blocked:
+        print(f"Capability-blocked (preflight {reason}): {tid}")
     return 0
 
 
