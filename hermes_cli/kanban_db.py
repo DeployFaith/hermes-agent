@@ -5428,6 +5428,204 @@ def decompose_triage_task(
     return child_ids
 
 
+@dataclass(frozen=True)
+class ArchivedRunReconcileItem:
+    task_id: str
+    applied: bool
+    eligible: bool
+    reason: str
+    run_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ArchivedRunReconcileResult:
+    items: tuple[ArchivedRunReconcileItem, ...]
+    applied: int
+    refused: int
+    dry_run: bool
+    atomic: bool
+
+
+_SQLITE_INT_MAX = (1 << 63) - 1
+_PID_MAX = (1 << 31) - 1
+
+
+def _bounded_positive_int(value: Any, *, maximum: int) -> Optional[int]:
+    """Parse a durable integer without accepting floats, overflow, or junk."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and 0 < len(value) <= 20 and value.isascii() and value.isdigit():
+        try:
+            parsed = int(value, 10)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    return parsed if 0 < parsed <= maximum else None
+
+
+def _archived_run_candidate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: int,
+    pid_alive,
+) -> ArchivedRunReconcileItem:
+    """Evaluate the complete fail-closed predicate without mutating state."""
+    task = conn.execute(
+        "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return ArchivedRunReconcileItem(task_id, False, False, "task_not_found")
+    if task["status"] != "archived":
+        return ArchivedRunReconcileItem(task_id, False, False, "task_not_archived")
+    open_runs = conn.execute(
+        "SELECT id, status, outcome, ended_at, claim_lock, claim_expires, worker_pid "
+        "FROM task_runs WHERE task_id = ? AND ended_at IS NULL ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    if len(open_runs) != 1:
+        reason = "no_open_run" if not open_runs else "multiple_open_runs"
+        return ArchivedRunReconcileItem(task_id, False, False, reason)
+    run = open_runs[0]
+    run_id = _bounded_positive_int(run["id"], maximum=_SQLITE_INT_MAX)
+    current_run_id = _bounded_positive_int(task["current_run_id"], maximum=_SQLITE_INT_MAX)
+    if run_id is None or current_run_id is None:
+        return ArchivedRunReconcileItem(task_id, False, False, "run_id_malformed")
+    if run_id != current_run_id:
+        return ArchivedRunReconcileItem(task_id, False, False, "run_pointer_mismatch", run_id)
+    if run["status"] != "running" or run["outcome"] is not None:
+        return ArchivedRunReconcileItem(task_id, False, False, "run_terminal", run_id)
+    task_lock = task["claim_lock"]
+    run_lock = run["claim_lock"]
+    if not isinstance(task_lock, str) or not isinstance(run_lock, str) or task_lock != run_lock:
+        return ArchivedRunReconcileItem(task_id, False, False, "ownership_mismatch", run_id)
+    if not task_lock or len(task_lock) > 300 or ":" not in task_lock:
+        return ArchivedRunReconcileItem(task_id, False, False, "ownership_malformed", run_id)
+    host, raw_bound_pid = task_lock.rsplit(":", 1)
+    bound_pid = _bounded_positive_int(raw_bound_pid, maximum=_PID_MAX)
+    if not host or len(host) > 255 or bound_pid is None:
+        return ArchivedRunReconcileItem(task_id, False, False, "ownership_malformed", run_id)
+    import socket
+    try:
+        local_host = socket.gethostname()
+    except Exception:
+        local_host = ""
+    if not local_host or local_host == "unknown" or host == "unknown" or host != local_host:
+        return ArchivedRunReconcileItem(task_id, False, False, "ownership_nonlocal", run_id)
+    task_pid = _bounded_positive_int(task["worker_pid"], maximum=_PID_MAX)
+    run_pid = _bounded_positive_int(run["worker_pid"], maximum=_PID_MAX)
+    if task_pid is None or run_pid is None:
+        return ArchivedRunReconcileItem(task_id, False, False, "pid_missing_or_malformed", run_id)
+    # The lock's PID identifies the local dispatcher/claimer; worker_pid is
+    # assigned only after spawn and therefore normally differs.  The durable
+    # worker binding is conclusive when task/run mirror the same bounded PID
+    # under the same validated host-local claim lock.
+    if task_pid != run_pid:
+        return ArchivedRunReconcileItem(task_id, False, False, "pid_ownership_mismatch", run_id)
+    task_expiry = _bounded_positive_int(task["claim_expires"], maximum=_SQLITE_INT_MAX)
+    run_expiry = _bounded_positive_int(run["claim_expires"], maximum=_SQLITE_INT_MAX)
+    if task_expiry is None or run_expiry is None:
+        return ArchivedRunReconcileItem(task_id, False, False, "expiry_missing_or_malformed", run_id)
+    if task_expiry != run_expiry:
+        return ArchivedRunReconcileItem(task_id, False, False, "expiry_mismatch", run_id)
+    if task_expiry >= now:
+        return ArchivedRunReconcileItem(task_id, False, False, "ownership_not_expired", run_id)
+    try:
+        alive = bool(pid_alive(task_pid))
+    except Exception:
+        return ArchivedRunReconcileItem(task_id, False, False, "liveness_unknown", run_id)
+    if alive:
+        return ArchivedRunReconcileItem(task_id, False, False, "worker_alive", run_id)
+    return ArchivedRunReconcileItem(task_id, False, True, "eligible", run_id)
+
+
+def reconcile_archived_runs(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    apply: bool = False,
+    allow_partial: bool = False,
+    now: Optional[int] = None,
+    pid_alive=None,
+) -> ArchivedRunReconcileResult:
+    """Safely close conclusively-local dead runs left under archived tasks.
+
+    Default apply mode is atomic: one refusal means no rows are changed.
+    Dry-run begins a deferred transaction and always rolls it back.
+    """
+    ids = tuple(dict.fromkeys(str(value).strip() for value in task_ids if str(value).strip()))
+    checked_at = int(time.time()) if now is None else int(now)
+    liveness = pid_alive or _pid_alive
+    if not ids:
+        return ArchivedRunReconcileResult((), 0, 0, not apply, not allow_partial)
+
+    def evaluate() -> list[ArchivedRunReconcileItem]:
+        return [
+            _archived_run_candidate(conn, task_id, now=checked_at, pid_alive=liveness)
+            for task_id in ids
+        ]
+
+    if not apply:
+        conn.execute("BEGIN DEFERRED")
+        try:
+            items = evaluate()
+        finally:
+            conn.execute("ROLLBACK")
+        return ArchivedRunReconcileResult(
+            tuple(items), 0, sum(not item.eligible for item in items), True, not allow_partial,
+        )
+
+    applied_items: list[ArchivedRunReconcileItem] = []
+    with write_txn(conn):
+        items = evaluate()  # transactionally recheck every predicate
+        if not allow_partial and any(not item.eligible for item in items):
+            return ArchivedRunReconcileResult(
+                tuple(items), 0, sum(not item.eligible for item in items), False, True,
+            )
+        for item in items:
+            if not item.eligible or item.run_id is None:
+                applied_items.append(item)
+                continue
+            ended_at = checked_at
+            run_cur = conn.execute(
+                "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
+                "summary = COALESCE(summary, 'archived orphan run reconciled'), "
+                "ended_at = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (ended_at, item.run_id, item.task_id),
+            )
+            task_cur = conn.execute(
+                "UPDATE tasks SET current_run_id = NULL, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'archived' AND current_run_id = ?",
+                (item.task_id, item.run_id),
+            )
+            if run_cur.rowcount != 1 or task_cur.rowcount != 1:
+                raise RuntimeError("archived run reconciliation CAS failed")
+            _append_event(
+                conn,
+                item.task_id,
+                "archived_run_reconciled",
+                {"run_id": item.run_id},
+                run_id=item.run_id,
+            )
+            applied_items.append(ArchivedRunReconcileItem(
+                item.task_id, True, True, "applied", item.run_id,
+            ))
+    return ArchivedRunReconcileResult(
+        tuple(applied_items),
+        sum(item.applied for item in applied_items),
+        sum(not item.eligible for item in applied_items),
+        False,
+        not allow_partial,
+    )
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
@@ -5928,12 +6126,11 @@ class DispatchResult:
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
-    """Ready task ids skipped because their assignee names a control-plane
-    lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
-    profile. Expected steady-state on multi-lane setups; NOT an
-    operator-actionable failure. Tracked separately so health telemetry
-    can distinguish "real stuck" (nothing spawned but spawnable work
-    available) from "correctly idle" (nothing spawnable in the queue)."""
+    """Task ids refused because the assignee is missing, malformed, a raw
+    peer identity, or does not resolve to a local Hermes profile."""
+    preflight_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks capability-blocked before claim because a required skill could
+    not be proven available, as ``(task_id, bounded_reason_code)`` pairs."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -7146,6 +7343,41 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
+_SKILL_PREFLIGHT_FAILURE_CODES = frozenset({
+    "skill_qualified_unsupported", "skill_name_invalid", "skill_disabled",
+    "skill_config_unreadable", "skill_scan_depth", "skill_scan_limit",
+    "skill_scan_unreadable", "skill_path_escape", "metadata_unreadable",
+    "metadata_malformed", "oversized", "skill_missing",
+    "skill_platform_incompatible",
+})
+
+
+def _capability_block_preflight(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: str,
+    reason: str,
+) -> bool:
+    """CAS-block an unclaimed task; never emit an event after a CAS miss."""
+    bounded = reason if reason in _SKILL_PREFLIGHT_FAILURE_CODES else "skill_unavailable"
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+            "last_failure_error = ? WHERE id = ? AND status = ? AND claim_lock IS NULL",
+            (f"required_skill_preflight:{bounded}", task_id, expected_status),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "capability_blocked",
+            {"reason": bounded, "source": "required_skill_preflight"},
+        )
+    return True
+
+
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -7370,15 +7602,17 @@ def _dispatch_once_locked(
     _default_assignee_resolved = False
     if _default_assignee:
         try:
+            from hermes_cli.kanban_preflight import normalize_local_profile
             from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
+            _default_assignee, identity_code = normalize_local_profile(_default_assignee)
+            _default_assignee_resolved = bool(
+                _default_assignee and identity_code == "ok" and _pe(_default_assignee)
+            )
         except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+            _default_assignee_resolved = False
+    # Per-tick, non-global resolver cache: each profile tree is scanned at most
+    # once while the board dispatch lock is held.
+    _preflight_cache: dict[str, Any] = {}
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -7401,11 +7635,14 @@ def _dispatch_once_locked(
                 if not dry_run:
                     try:
                         with write_txn(conn):
-                            conn.execute(
+                            assigned = conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
+                                "AND status = 'ready' AND claim_lock IS NULL "
                                 "AND (assignee IS NULL OR assignee = '')",
                                 (_default_assignee, row["id"]),
                             )
+                            if assigned.rowcount != 1:
+                                continue
                             _append_event(
                                 conn, row["id"], "assigned",
                                 {
@@ -7426,29 +7663,29 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
+        # Identity and required-capability preflight must precede every
+        # respawn/retry guard and every claim/run/workspace/spawn mutation.
+        from hermes_cli.kanban_preflight import preflight_spawn
+        pending = get_task(conn, row["id"])
+        preflight = preflight_spawn(
+            row_assignee,
+            pending.skills if pending else (),
+            shared_home=kanban_home(),
+            cache=_preflight_cache,
+        )
+        if not preflight.ok:
+            if preflight.code in _SKILL_PREFLIGHT_FAILURE_CODES:
+                if not dry_run and _capability_block_preflight(
+                    conn,
+                    row["id"],
+                    expected_status="ready",
+                    reason=preflight.code,
+                ):
+                    result.preflight_blocked.append((row["id"], preflight.code))
+            else:
+                result.skipped_nonspawnable.append(row["id"])
             continue
+        row_assignee = preflight.profile
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -7497,6 +7734,7 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        claimed.skills = list(preflight.skills)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -7576,12 +7814,26 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
+        from hermes_cli.kanban_preflight import preflight_spawn
+        pending = get_task(conn, row["id"])
+        preflight = preflight_spawn(
+            row["assignee"],
+            pending.skills if pending else (),
+            review=True,
+            shared_home=kanban_home(),
+            cache=_preflight_cache,
+        )
+        if not preflight.ok:
+            if preflight.code in _SKILL_PREFLIGHT_FAILURE_CODES:
+                if not dry_run and _capability_block_preflight(
+                    conn,
+                    row["id"],
+                    expected_status="review",
+                    reason=preflight.code,
+                ):
+                    result.preflight_blocked.append((row["id"], preflight.code))
+            else:
+                result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
@@ -7613,7 +7865,7 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        claimed.skills = list(preflight.skills)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -7923,9 +8175,10 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
-    from hermes_cli.profiles import normalize_profile_name
-
-    profile_arg = normalize_profile_name(task.assignee)
+    from hermes_cli.kanban_preflight import normalize_local_profile
+    profile_arg, identity_code = normalize_local_profile(task.assignee)
+    if not profile_arg or identity_code != "ok":
+        raise ValueError(f"task {task.id} has invalid assignee")
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
