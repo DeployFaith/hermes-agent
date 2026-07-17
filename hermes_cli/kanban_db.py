@@ -6053,6 +6053,9 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    resource_deferred: list[str] = field(default_factory=list)
+    """Host/board admission reasons that deferred all new workers this tick.
+    These do not claim a task and consume zero worker retries."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -7502,6 +7505,95 @@ def dispatch_once(
         )
 
 
+def _worker_resource_admission_reason(
+    conn: sqlite3.Connection,
+    kanban_cfg: Optional[dict] = None,
+) -> Optional[str]:
+    """Return a pre-spawn host/board blocker without claiming a task.
+
+    Admission failures are deliberately transient: the ready task remains
+    untouched and consumes zero retries. The checks cover the resources that
+    previously caused worker crash loops and SQLite I/O failures.
+    """
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = (load_config().get("kanban") or {})
+        except Exception:
+            kanban_cfg = {}
+    cfg = kanban_cfg or {}
+    if not bool(cfg.get("worker_resource_admission", False)):
+        return None
+
+    def _number(name: str, default: float) -> float:
+        try:
+            return float(cfg.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        meminfo: dict[str, int] = {}
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                key, sep, rest = line.partition(":")
+                if not sep:
+                    continue
+                raw = rest.strip().split()
+                if raw:
+                    meminfo[key] = int(raw[0])
+        available_mb = meminfo["MemAvailable"] / 1024
+        swap_total = meminfo.get("SwapTotal", 0)
+        swap_free = meminfo.get("SwapFree", 0)
+    except (OSError, KeyError, ValueError):
+        return "memory_metrics_unavailable"
+
+    min_mem_mb = _number("worker_min_available_mem_mb", 3072)
+    if available_mb < min_mem_mb:
+        return f"available_memory_mb={available_mb:.0f}<minimum={min_mem_mb:.0f}"
+    if swap_total > 0:
+        swap_used_pct = ((swap_total - swap_free) / swap_total) * 100
+        max_swap_pct = _number("worker_max_swap_used_percent", 50)
+        if swap_used_pct > max_swap_pct:
+            return f"swap_used_percent={swap_used_pct:.1f}>maximum={max_swap_pct:.1f}"
+
+    try:
+        root_free_mb = shutil.disk_usage("/").free / (1024 * 1024)
+        tmp_free_mb = shutil.disk_usage("/tmp").free / (1024 * 1024)
+    except OSError:
+        return "disk_metrics_unavailable"
+    min_root_mb = _number("worker_min_root_free_mb", 4096)
+    min_tmp_mb = _number("worker_min_tmp_free_mb", 1024)
+    if root_free_mb < min_root_mb:
+        return f"root_free_mb={root_free_mb:.0f}<minimum={min_root_mb:.0f}"
+    if tmp_free_mb < min_tmp_mb:
+        return f"tmp_free_mb={tmp_free_mb:.0f}<minimum={min_tmp_mb:.0f}"
+
+    pressure_path = Path("/proc/pressure/memory")
+    if pressure_path.exists():
+        try:
+            first = pressure_path.read_text(encoding="utf-8").splitlines()[0]
+            fields = dict(part.split("=", 1) for part in first.split()[1:] if "=" in part)
+            avg10 = float(fields["avg10"])
+        except (OSError, IndexError, KeyError, ValueError):
+            return "memory_pressure_metrics_unavailable"
+        max_pressure = _number("worker_max_memory_pressure_avg10", 5.0)
+        if avg10 > max_pressure:
+            return f"memory_pressure_avg10={avg10:.2f}>maximum={max_pressure:.2f}"
+
+    try:
+        quick = conn.execute("PRAGMA quick_check(1)").fetchone()
+        if not quick or str(quick[0]).lower() != "ok":
+            return "sqlite_quick_check_failed"
+        db_rows = conn.execute("PRAGMA database_list").fetchall()
+        main_path = next((str(row[2]) for row in db_rows if str(row[1]) == "main"), "")
+        if main_path and not os.access(os.path.dirname(main_path) or ".", os.W_OK):
+            return "sqlite_parent_not_writable"
+    except sqlite3.Error:
+        return "sqlite_health_check_failed"
+    return None
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -7593,6 +7685,14 @@ def _dispatch_once_locked(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    has_review_work = bool(conn.execute(
+        "SELECT 1 FROM tasks WHERE status = 'review' AND claim_lock IS NULL LIMIT 1"
+    ).fetchone())
+    if ready_rows or has_review_work:
+        admission_reason = _worker_resource_admission_reason(conn)
+        if admission_reason is not None:
+            result.resource_deferred.append(admission_reason)
+            return result
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
@@ -8166,6 +8266,68 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _systemd_scope_worker_cmd(task: Task, cmd: list[str]) -> list[str]:
+    """Wrap a worker in its own user-systemd scope when configured.
+
+    The worker PID is moved out of the dispatching gateway/daemon cgroup before
+    the Hermes command runs. A gateway restart can therefore no longer SIGKILL
+    active Kanban workers or their test/build descendants. ``systemd-run
+    --scope`` execs the command in place, so ``Popen.pid`` remains the real
+    worker PID and existing crash detection stays correct.
+    """
+    if _IS_WINDOWS:
+        return cmd
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = (load_config().get("kanban") or {})
+    except Exception:
+        cfg = {}
+    if not bool(cfg.get("worker_systemd_scope", False)):
+        return cmd
+
+    import shutil
+
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        raise RuntimeError(
+            "kanban.worker_systemd_scope=true but systemd-run is unavailable"
+        )
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        raise RuntimeError(
+            "kanban.worker_systemd_scope=true but no user systemd runtime is available"
+        )
+
+    run_id = task.current_run_id if task.current_run_id is not None else "pending"
+    raw_unit = f"hermes-kanban-{task.id}-{run_id}"
+    unit = re.sub(r"[^A-Za-z0-9_.-]", "-", raw_unit)[:220]
+    wrapped = [
+        systemd_run,
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        f"--unit={unit}",
+        "--property=OOMPolicy=continue",
+        "--property=MemoryAccounting=yes",
+    ]
+    memory_high_mb = _positive_int(
+        cfg.get("worker_memory_high_mb"), 1536, minimum=128,
+    )
+    memory_max_mb = _positive_int(
+        cfg.get("worker_memory_max_mb"), 2048, minimum=256,
+    )
+    if memory_max_mb < memory_high_mb:
+        memory_max_mb = memory_high_mb
+    wrapped.extend([
+        f"--property=MemoryHigh={memory_high_mb}M",
+        f"--property=MemoryMax={memory_max_mb}M",
+        "--",
+    ])
+    wrapped.extend(cmd)
+    return wrapped
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8318,6 +8480,12 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+
+    # Move the worker and all descendants into a transient user-systemd scope
+    # before Hermes starts. This keeps gateway restarts from killing live work
+    # and applies per-worker memory accounting/limits when enabled.
+    cmd = _systemd_scope_worker_cmd(task, cmd)
+
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

@@ -8,6 +8,7 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -114,6 +115,58 @@ def test_cli_invalid_max_in_progress_silently_disables(isolated_kanban_home, mon
             f"invalid max_in_progress={bad_val!r} should fall through to None, "
             f"got {captured.get('max_in_progress')!r}"
         )
+
+
+def test_cli_dispatch_surfaces_resource_deferrals_in_json(
+    isolated_kanban_home, monkeypatch, capsys
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    result = kanban_db.DispatchResult(
+        resource_deferred=["available_memory_mb=512<minimum=3072"]
+    )
+    monkeypatch.setattr(kanban_db, "dispatch_once", lambda conn, **kw: result)
+
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=True)
+    assert kb_cli._cmd_dispatch(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["resource_deferred"] == [
+        "available_memory_mb=512<minimum=3072"
+    ]
+
+
+def test_cli_dispatch_tolerates_legacy_result_without_resource_field(
+    isolated_kanban_home, monkeypatch, capsys
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    result = kanban_db.DispatchResult()
+    del result.resource_deferred
+    monkeypatch.setattr(kanban_db, "dispatch_once", lambda conn, **kw: result)
+
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=True)
+    assert kb_cli._cmd_dispatch(args) == 0
+    assert json.loads(capsys.readouterr().out)["resource_deferred"] == []
+
+
+def test_cli_dispatch_prints_each_resource_deferral(
+    isolated_kanban_home, monkeypatch, capsys
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    result = kanban_db.DispatchResult(
+        resource_deferred=["low memory", "disk headroom below minimum"]
+    )
+    monkeypatch.setattr(kanban_db, "dispatch_once", lambda conn, **kw: result)
+
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=False)
+    assert kb_cli._cmd_dispatch(args) == 0
+    output = capsys.readouterr().out
+    assert "Deferred (worker resource admission): low memory" in output
+    assert "Deferred (worker resource admission): disk headroom below minimum" in output
 
 
 def test_kanban_swarm_uses_existing_humanizer_skill():

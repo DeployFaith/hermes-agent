@@ -109,6 +109,100 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _probe_dispatch_health(kb, results) -> tuple[bool, list[str]]:
+    """Return ``(actionable_ready, intentional_deferrals)`` across boards.
+
+    Resource admission leaves every ready/review row on a board untouched;
+    per-profile capacity leaves only the explicitly reported task ids waiting.
+    Correlating those result signals with the post-tick queue prevents expected
+    deferral from being misreported as a profile/venv spawn failure.
+    """
+    result_by_slug = {slug: res for slug, res in (results or [])}
+    deferrals: list[str] = []
+    try:
+        boards = kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [kb.read_board_metadata(kb.DEFAULT_BOARD)]
+
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None
+
+    for board in boards:
+        slug = board.get("slug") or kb.DEFAULT_BOARD
+        res = result_by_slug.get(slug)
+        if res is not None and (getattr(res, "skipped_unassigned", []) or []):
+            return True, deferrals
+
+        resource_reasons = (
+            list(getattr(res, "resource_deferred", []) or [])
+            if res is not None else []
+        )
+        if resource_reasons:
+            deferrals.extend(f"[{slug}] {reason}" for reason in resource_reasons)
+            continue
+
+        capped_entries = (
+            list(getattr(res, "skipped_per_profile_capped", []) or [])
+            if res is not None else []
+        )
+        capped_ids = {entry[0] for entry in capped_entries}
+        if capped_entries:
+            by_profile: dict[tuple[str, int], int] = {}
+            for _tid, assignee, current in capped_entries:
+                key = (str(assignee), int(current))
+                by_profile[key] = by_profile.get(key, 0) + 1
+            for (assignee, current), count in sorted(by_profile.items()):
+                deferrals.append(
+                    f"[{slug}] profile {assignee} at capacity "
+                    f"({current} running; {count} task(s) deferred)"
+                )
+
+        conn = None
+        try:
+            conn = kb.connect(board=slug)
+            rows = conn.execute(
+                "SELECT id, assignee FROM tasks "
+                "WHERE status IN ('ready', 'review') AND claim_lock IS NULL"
+            ).fetchall()
+            for row in rows:
+                task_id = row["id"]
+                assignee = row["assignee"]
+                if not assignee:
+                    return True, deferrals
+                if task_id in capped_ids:
+                    continue
+                if profile_exists is None or profile_exists(assignee):
+                    # Includes a real spawn failure released back to ready.
+                    return True, deferrals
+        except Exception:
+            # Preserve the old conservative probe behavior on DB errors.
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return False, deferrals
+
+
+def _next_dispatch_bad_ticks(
+    bad_ticks: int, *, actionable_ready: bool, any_spawned: bool
+) -> int:
+    """Advance stuck telemetry only for actionable, unserved ready work."""
+    return bad_ticks + 1 if actionable_ready and not any_spawned else 0
+
+
+def _bounded_deferral_signal(reasons: list[str]) -> str:
+    """Format an informative but bounded admission/capacity log payload."""
+    limited = [str(reason)[:200] for reason in reasons[:8]]
+    if len(reasons) > len(limited):
+        limited.append(f"... and {len(reasons) - len(limited)} more")
+    return "; ".join(limited)[:2000]
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -940,6 +1034,7 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        last_deferral_log_at = 0
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1076,41 +1171,6 @@ class GatewayKanbanWatchersMixin:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 out.append((slug, _tick_once_for_board(slug)))
             return out
-
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
-
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
-            """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                conn = None
-                try:
-                    conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _kb.has_spawnable_review(conn):
-                        return True
-                except Exception:
-                    continue
-                finally:
-                    if conn is not None:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-            return False
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -1250,12 +1310,25 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
-                # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
-                    bad_ticks += 1
-                else:
-                    bad_ticks = 0
+                # Health telemetry (aggregate across boards). Correlate the
+                # queue with this tick's admission/capacity diagnostics so
+                # intentionally deferred rows do not count as stuck.
+                ready_pending, intentional_deferrals = await asyncio.to_thread(
+                    _probe_dispatch_health, _kb, results
+                )
+                bad_ticks = _next_dispatch_bad_ticks(
+                    bad_ticks,
+                    actionable_ready=ready_pending,
+                    any_spawned=any_spawned,
+                )
+                if intentional_deferrals and not ready_pending and not any_spawned:
+                    now = int(time.time())
+                    if now - last_deferral_log_at >= 300:
+                        logger.info(
+                            "kanban dispatcher: worker launch intentionally deferred: %s",
+                            _bounded_deferral_signal(intentional_deferrals),
+                        )
+                        last_deferral_log_at = now
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:

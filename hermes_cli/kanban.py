@@ -2262,6 +2262,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
     if getattr(args, "json", False):
+        resource_deferred = list(getattr(res, "resource_deferred", []) or [])
         print(json.dumps({
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
@@ -2279,6 +2280,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "resource_deferred": resource_deferred,
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2312,6 +2314,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
+    for reason in getattr(res, "resource_deferred", []) or []:
+        print(f"Deferred (worker resource admission): {reason}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "

@@ -8,8 +8,14 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _bounded_deferral_signal,
+    _next_dispatch_bad_ticks,
+    _probe_dispatch_health,
+)
 
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
@@ -67,3 +73,107 @@ def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     h3, st3 = _acquire_singleton_lock(lock)
     assert st3 == "held" and h3 is not None
     _release_singleton_lock(h3)
+
+
+class _HealthConn:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def execute(self, _query):
+        return self
+
+    def fetchall(self):
+        return self.rows
+
+    def close(self):
+        pass
+
+
+class _HealthKb:
+    DEFAULT_BOARD = "default"
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def list_boards(self, include_archived=False):
+        return [{"slug": "default"}]
+
+    def connect(self, board=None):
+        return _HealthConn(self.rows)
+
+
+def _dispatch_result(**overrides):
+    values = {
+        "skipped_unassigned": [],
+        "resource_deferred": [],
+        "skipped_per_profile_capped": [],
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_resource_admission_deferral_resets_stuck_ticks():
+    result = _dispatch_result(
+        resource_deferred=["available_memory_mb=512<minimum=3072"]
+    )
+    actionable, reasons = _probe_dispatch_health(
+        _HealthKb([{"id": "t1", "assignee": "default"}]),
+        [("default", result)],
+    )
+
+    assert actionable is False
+    assert reasons == ["[default] available_memory_mb=512<minimum=3072"]
+    assert _next_dispatch_bad_ticks(
+        5, actionable_ready=actionable, any_spawned=False
+    ) == 0
+
+
+def test_profile_capacity_deferral_does_not_hide_other_failed_spawn(monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    result = _dispatch_result(
+        skipped_per_profile_capped=[("t_capped", "writer", 2)]
+    )
+    kb = _HealthKb([
+        {"id": "t_capped", "assignee": "writer"},
+        {"id": "t_failed", "assignee": "reviewer"},
+    ])
+
+    actionable, reasons = _probe_dispatch_health(kb, [("default", result)])
+
+    assert actionable is True
+    assert "profile writer at capacity" in reasons[0]
+    assert _next_dispatch_bad_ticks(
+        2, actionable_ready=actionable, any_spawned=False
+    ) == 3
+
+
+def test_profile_capacity_only_resets_stuck_ticks(monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    result = _dispatch_result(
+        skipped_per_profile_capped=[("t_capped", "writer", 2)]
+    )
+    actionable, reasons = _probe_dispatch_health(
+        _HealthKb([{"id": "t_capped", "assignee": "writer"}]),
+        [("default", result)],
+    )
+
+    assert actionable is False
+    assert reasons
+    assert _next_dispatch_bad_ticks(
+        5, actionable_ready=actionable, any_spawned=False
+    ) == 0
+
+
+def test_unassigned_ready_work_remains_stuck_eligible():
+    result = _dispatch_result(skipped_unassigned=["t_unassigned"])
+    actionable, _reasons = _probe_dispatch_health(
+        _HealthKb([{"id": "t_unassigned", "assignee": None}]),
+        [("default", result)],
+    )
+    assert actionable is True
+
+
+def test_deferral_signal_is_bounded():
+    signal = _bounded_deferral_signal(["x" * 500] * 20)
+    assert len(signal) <= 2000
+    assert "and 12 more" in signal
